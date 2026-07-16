@@ -95,14 +95,18 @@ class DeviceState:
         counter = cmd.get("counter")
         if not isinstance(counter, int) or counter <= self.data["last_applied_counter"]:
             return False, "replayed or stale counter"
-        if cmd.get("mode") not in MODES:
+        mode = cmd.get("mode")
+        if mode is not None and mode not in MODES:
             return False, "unknown mode"
         ring = cmd.get("ring")
         if isinstance(ring, int) and ring > self.data["last_ring"]:
             self.data["last_ring"] = ring  # caller compares before/after to ring
-        self.data["mode"] = cmd["mode"]
+        if mode is not None:
+            # Ring-only commands omit mode so they don't clobber the stored
+            # lost message/contact the lost screen renders.
+            self.data["mode"] = mode
+            self.data["command"] = cmd
         self.data["last_applied_counter"] = counter
-        self.data["command"] = cmd
         self.save()
         return True, "applied"
 
