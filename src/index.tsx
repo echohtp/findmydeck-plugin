@@ -1,11 +1,10 @@
 // Find My Steam Deck — QAM frontend.
 //
-// Enrollment happens HERE (spec §1.1): password -> Argon2id -> keypairs,
-// public keys go to the backend, password + secret keys are wiped from
-// memory before the call returns. The Python backend never sees them.
-//
-// Covertness rule (spec §3): when the device is in `stolen` mode this panel
-// renders exactly as it does in `normal` mode. Only `lost` is visible.
+// Enrollment happens HERE: password -> Argon2id -> keypairs, public keys go
+// to the backend, password + secret keys are wiped from memory before the
+// call returns. The Python backend never sees them. Unenrolling re-derives
+// the keys from the password to sign an unenroll payload — proof of
+// ownership, so a thief cannot switch tracking off from the menus.
 
 import {
   PanelSection, PanelSectionRow, TextField, ButtonItem, Field, staticClasses,
@@ -15,6 +14,7 @@ import {
   callable, definePlugin, toaster, useQuickAccessVisible, routerHook, addEventListener, removeEventListener,
 } from '@decky/api';
 import { useEffect, useRef, useState } from 'react';
+import { KDF_V1, deriveKeys, genSalt, signCommand, wipe } from './lib/crypto.mjs';
 
 const LOST_ROUTE = '/findmydeck/lost';
 const RING_ROUTE = '/findmydeck/ring';
@@ -39,11 +39,11 @@ function reactToMode(mode: string, command?: { message?: string } | null) {
   // Leaving lost is handled by LostScreen itself (it NavigateBacks when the
   // mode clears), so no exit logic is needed here.
 }
-import { KDF_V1, deriveKeys, genSalt, wipe } from './lib/crypto.mjs';
 
 type Status = {
   enrolled: boolean; server_url?: string; device_id?: string; mode?: string;
   seq?: number; counter?: number; queued?: number;
+  salt?: string; kdf?: object;
   last_report_ts?: number; last_report_ok?: boolean;
   command?: { message?: string; contact?: string } | null;
   backend_error?: string;
@@ -63,7 +63,7 @@ const enrollBackend = callable<
   [string, string, string, string, string, object, string],
   { ok: boolean; error?: string; device_id?: string }
 >('enroll');
-const unenroll = callable<[], { ok: boolean }>('unenroll');
+const unenroll = callable<[string, string], { ok: boolean; error?: string }>('unenroll');
 // Event-driven check: poll for a command + report if due. Cheap enough to
 // fire on UI events instead of a hot timer.
 const eventCheck = callable<[string], { ok: boolean; mode?: string }>('event_check');
@@ -72,7 +72,10 @@ type ChatMsg = { sender: 'owner' | 'finder'; body: string; created_at: number };
 const getMessages = callable<[], { ok: boolean; messages: ChatMsg[] }>('get_messages');
 const sendMessage = callable<[string], { ok: boolean }>('send_message');
 
-const MIN_PASSWORD_LEN = 6;
+// The server stores salt + public keys, so a malicious operator can guess
+// passwords offline (Argon2id makes each guess cost ~seconds, but short
+// passwords still fall). Require enough length to make that pointless.
+const MIN_PASSWORD_LEN = 10;
 
 function EnrollForm({ onDone }: { onDone: () => void }) {
   // Default to the hosted instance; editable for self-hosters.
@@ -87,20 +90,21 @@ function EnrollForm({ onDone }: { onDone: () => void }) {
     if (pw.length < MIN_PASSWORD_LEN) return setErr(`Password must be ${MIN_PASSWORD_LEN}+ characters.`);
     if (!pairCode.trim()) return setErr('Enter the pair code from the dashboard.');
     setBusy(true); setErr('');
+    let keys: Awaited<ReturnType<typeof deriveKeys>> | undefined;
     try {
       const salt = await genSalt();
       // ~256 MiB Argon2id: takes a few seconds on the Deck — that is the point.
-      const keys = await deriveKeys(pw, salt, KDF_V1);
+      keys = await deriveKeys(pw, salt, KDF_V1);
       setPw(''); // discard password state immediately after derive
       const res = await enrollBackend(
         server.trim(), pairCode.trim(), keys.boxPk, keys.signPk, salt, KDF_V1, name.trim(),
       );
-      wipe(keys.boxSk, keys.signSk); // secrets never leave this function
       if (!res.ok) { setErr(res.error || 'enrollment failed'); return; }
       onDone();
     } catch (e) {
       setErr(String(e));
     } finally {
+      wipe(keys?.boxSk, keys?.signSk); // secrets never leave this function
       setBusy(false);
     }
   };
@@ -168,10 +172,10 @@ function LostScreen() {
     return () => clearInterval(t);
   }, []);
   const isLost = (status?.mode ?? 'lost') === 'lost';
-  const siren = useSiren(isLost && !muted);
+  useSiren(isLost && !muted);
   const [chatOpen, setChatOpen] = useState(false);
 
-  // Owner set it back to normal/stolen → get out of the way.
+  // Owner set it back to normal → get out of the way.
   useEffect(() => {
     if (status && status.mode !== 'lost') Navigation.NavigateBack();
   }, [status?.mode]);
@@ -206,7 +210,7 @@ function LostScreen() {
         Also helpful: connect this Deck to any Wi-Fi network so its owner can locate it.
       </div>
       <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', justifyContent: 'center' }}>
-        <DialogButton style={{ maxWidth: '260px' }} onClick={() => { setMuted((m) => !m); if (muted) siren.start(); else siren.stop(); }}>
+        <DialogButton style={{ maxWidth: '260px' }} onClick={() => setMuted((m) => !m)}>
           {muted ? '🔊 Sound on' : '🔇 Silence'}
         </DialogButton>
         <DialogButton style={{ maxWidth: '260px' }} onClick={() => Navigation.NavigateBack()}>
@@ -254,7 +258,7 @@ function LostChat() {
           ))}
         </div>
       )}
-      <TextField value={text} onChange={(e) => setText(e.target.value)} placeholder="Type a message to the owner…" />
+      <TextField label="Type a message to the owner…" value={text} onChange={(e) => setText(e.target.value)} />
       <DialogButton disabled={busy || !text.trim()} onClick={send}>
         {busy ? 'Sending…' : 'Send to owner'}
       </DialogButton>
@@ -272,7 +276,7 @@ function RingScreen() {
       alignItems: 'center', justifyContent: 'center', textAlign: 'center', gap: '1.4rem',
       background: 'linear-gradient(160deg, #1a2a3f, #0a1622)', color: '#fff',
     }}>
-      <div style={{ fontSize: '5rem', animation: 'none' }}>📢</div>
+      <div style={{ fontSize: '5rem' }}>📢</div>
       <div style={{ fontSize: '2rem', fontWeight: 800 }}>Find My Deck is ringing</div>
       <div style={{ fontSize: '1.3rem', opacity: 0.9, maxWidth: '60ch' }}>
         The owner is trying to locate this Steam Deck.
@@ -305,6 +309,64 @@ function LostBanner({ command }: { command: NonNullable<Status['command']> }) {
   );
 }
 
+// Unenrolling needs the recovery password: keys are re-derived and an
+// owner-signed unenroll payload handed to the backend, which verifies it
+// against the enrolled sign_pk. Merely holding the Deck is not enough.
+function UnenrollSection({ status, onDone }: { status: Status; onDone: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [pw, setPw] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async () => {
+    if (!status.salt) return setErr('Missing enrollment data — re-enroll to fix, or remove via the dashboard.');
+    setBusy(true); setErr('');
+    let keys: Awaited<ReturnType<typeof deriveKeys>> | undefined;
+    try {
+      keys = await deriveKeys(pw, status.salt, status.kdf || KDF_V1);
+      setPw('');
+      const cmd = await signCommand(
+        { action: 'unenroll', counter: (status.counter ?? 0) + 1 }, keys.signSk,
+      );
+      const res = await unenroll(cmd.payload, cmd.sig);
+      if (!res.ok) { setErr(res.error === 'wrong password' ? 'Wrong password.' : res.error || 'unenroll failed'); return; }
+      onDone();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      wipe(keys?.boxSk, keys?.signSk);
+      setBusy(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => setOpen(true)}>Unenroll this Deck…</ButtonItem>
+      </PanelSectionRow>
+    );
+  }
+  return (
+    <>
+      <PanelSectionRow>
+        <TextField label="Recovery password (confirms you own this Deck)" bIsPassword
+          value={pw} onChange={(e) => setPw(e.target.value)} />
+      </PanelSectionRow>
+      {err && <PanelSectionRow><Field description={err} /></PanelSectionRow>}
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy || pw.length === 0} onClick={submit}>
+          {busy ? 'Checking…' : 'Erase enrollment'}
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy} onClick={() => { setOpen(false); setPw(''); setErr(''); }}>
+          Cancel
+        </ButtonItem>
+      </PanelSectionRow>
+    </>
+  );
+}
+
 function Content() {
   const [status, setStatus] = useState<Status | null>(null);
   const [loadErr, setLoadErr] = useState('');
@@ -314,7 +376,7 @@ function Content() {
     .catch((e) => setLoadErr(String(e)));
 
   // Pop a real Steam toast when the Deck ENTERS lost mode (once per
-  // transition). Never for stolen — that mode is covert by design.
+  // transition).
   const notifyLost = (s: Status) => {
     const mode = s.mode ?? 'normal';
     // Keep the dedupe baseline in sync; the backend event drives transitions.
@@ -354,7 +416,6 @@ function Content() {
   if (!status.enrolled) return <EnrollForm onDone={refresh} />;
   if (status.mode === 'lost' && status.command) return <LostBanner command={status.command} />;
 
-  // `normal` AND `stolen` render identically — covert by design.
   const stale = status.last_report_ok === false || (status.queued ?? 0) > 0;
   return (
     <PanelSection title="Find My Deck">
@@ -367,19 +428,12 @@ function Content() {
       <PanelSectionRow>
         <Field description="Updates automatically every hour and whenever the Deck wakes on WiFi." />
       </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => { if (confirm('Stop protecting this Deck and erase its enrollment?')) unenroll().then(refresh); }}>
-          Unenroll this Deck
-        </ButtonItem>
-      </PanelSectionRow>
+      <UnenrollSection status={status} onDone={refresh} />
     </PanelSection>
   );
 }
 
 export default definePlugin(() => {
-  // Fire an event-driven check when a game exits (the Deck returns to the
-  // library — a natural, battery-cheap moment to sync). Runs plugin-wide,
-  // so it works even if the QAM panel is never opened.
   routerHook.addRoute(LOST_ROUTE, LostScreen, { exact: true });
 
   // Backend-pushed mode changes — fires even when the QAM is closed / in a
@@ -395,14 +449,25 @@ export default definePlugin(() => {
   };
   addEventListener('fmsd_ring', onRing);
 
-  let unregister: (() => void) | undefined;
+  // Event-driven checks at natural, battery-cheap moments: a game exiting
+  // (Deck returns to the library) and resume from suspend (the moment a
+  // lost Deck is most likely to touch WiFi). Both run plugin-wide, so they
+  // work even if the QAM panel is never opened.
+  const sc = (window as unknown as { SteamClient?: any }).SteamClient;
+  let unregisterGameExit: (() => void) | undefined;
   try {
-    const sc = (window as unknown as { SteamClient?: any }).SteamClient;
     const reg = sc?.GameSessions?.RegisterForAppLifetimeNotifications?.((u: { bRunning: boolean }) => {
       if (!u.bRunning) eventCheck('game-exit').catch(() => {});
     });
-    unregister = reg?.unregister?.bind(reg);
+    unregisterGameExit = reg?.unregister?.bind(reg);
   } catch { /* not in Game Mode / API shape changed — events just won't fire */ }
+  let unregisterResume: (() => void) | undefined;
+  try {
+    const reg = sc?.System?.RegisterForOnResumeFromSuspend?.(() => {
+      eventCheck('resume').catch(() => {});
+    });
+    unregisterResume = reg?.unregister?.bind(reg);
+  } catch { /* backend boottime check still catches wake on its next tick */ }
 
   // On load, if already lost, jump straight to the full-screen surface.
   getStatus().then((s) => { if (s.mode) reactToMode(s.mode, s.command); }).catch(() => {});
@@ -427,7 +492,9 @@ export default definePlugin(() => {
     content: <Content />,
     icon: <span>🛰</span>,
     onDismount() {
-      unregister?.();
+      clearInterval(watchdog);
+      unregisterGameExit?.();
+      unregisterResume?.();
       removeEventListener('fmsd_mode', onMode);
       removeEventListener('fmsd_ring', onRing);
       routerHook.removeRoute(LOST_ROUTE);

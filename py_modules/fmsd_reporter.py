@@ -1,4 +1,4 @@
-"""Build + seal + deliver one report — spec §1.2 / §3."""
+"""Build + seal + deliver one report."""
 
 from __future__ import annotations
 

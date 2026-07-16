@@ -17,11 +17,27 @@ proven by the monorepo's interop tests).
   password and secret keys are wiped from memory before the call returns.
 - Reports are `crypto_box_seal`ed to the owner's X25519 public key with an
   ephemeral sender key — the device cannot decrypt its own past reports.
-- Commands (lost/stolen/normal, ring, messages) are Ed25519-detached-signed
-  by the owner; the device verifies the exact received payload bytes before
-  parsing. The server cannot forge commands.
-- In `stolen` mode the QAM panel renders exactly as in `normal` mode; only
-  `lost` mode is visible on-device.
+- Commands (mode changes and ring) are Ed25519-detached-signed by the owner
+  with a strictly monotonic counter; the device verifies the exact received
+  payload bytes before parsing. The server cannot forge or replay commands,
+  and cannot make the Deck ring on its own.
+- Unenrolling from the QAM requires the recovery password: the frontend
+  re-derives the keys and signs an unenroll payload the backend verifies, so
+  whoever merely holds the Deck cannot switch tracking off from the menus.
+- The plugin refuses plain-`http` server URLs (loopback excepted for
+  development).
+
+Known limitations, on purpose and worth knowing:
+
+- The server stores the KDF salt and public keys, so a malicious server
+  operator can mount an **offline password-guessing attack**. Argon2id at
+  256 MiB makes each guess expensive; the UI enforces a 10+ character
+  password, and a genuinely strong passphrase is your real defense.
+- The lost-mode **finder↔owner chat is plaintext to the server** (the finder
+  has no key material). Location reports stay sealed; chat is a relay
+  feature, not a zero-knowledge one.
+- Lost mode is a loud banner, not a lock. A wipe/reinstall removes the
+  plugin; this is recovery tooling, not theft prevention hardware.
 
 ## Why the `_root` flag
 
@@ -31,7 +47,9 @@ data used to locate the device; this requires root on SteamOS.
 ## Layout
 
 - `main.py` — Decky backend: heartbeat loop, command poll, report upload,
-  disk retry queue. Wake-from-suspend is treated as a connect event.
+  disk retry queue. Wake-from-suspend (detected via CLOCK_BOOTTIME vs
+  CLOCK_MONOTONIC divergence, plus a frontend resume hook) is treated as a
+  network-connect event and reports immediately.
 - `py_modules/` — pure-stdlib Python: crypto (ctypes → libsodium), HTTP
   client, state machine, scanner, retry queue.
 - `src/` — React QAM frontend (`@decky/ui`), enrollment + lost/ring screens.

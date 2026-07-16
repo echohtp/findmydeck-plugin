@@ -1,6 +1,6 @@
-"""On-device retry queue — spec §3.
+"""On-device retry queue.
 
-A stolen Deck touching WiFi for 30 seconds is the report you can't afford
+A lost Deck touching WiFi for 30 seconds is the report you can't afford
 to lose: if upload fails, persist the (already sealed, therefore harmless)
 blob to disk and retry oldest-first on every network-up.
 """
@@ -25,7 +25,9 @@ class RetryQueue:
 
     def enqueue(self, blob: str) -> None:
         self._n += 1
-        name = f"{time.monotonic_ns():020d}-{self._n:06d}.blob"
+        # Wall clock, not monotonic: names must still sort oldest-first
+        # after a reboot, or the MAX_QUEUED eviction culls the wrong end.
+        name = f"{time.time_ns():020d}-{self._n:06d}.blob"
         tmp = os.path.join(self.dir, name + ".tmp")
         with open(tmp, "w", encoding="ascii") as f:
             f.write(blob)
@@ -51,6 +53,13 @@ class RetryQueue:
             os.unlink(path)
             sent += 1
         return sent, len(self._files())
+
+    def clear(self) -> None:
+        for name in self._files():
+            try:
+                os.unlink(os.path.join(self.dir, name))
+            except OSError:
+                pass
 
     def __len__(self) -> int:
         return len(self._files())

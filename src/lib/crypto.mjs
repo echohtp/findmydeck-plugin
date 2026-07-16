@@ -1,8 +1,8 @@
-// Find My Steam Deck — crypto core (TS/JS side).
+// Find My Steam Deck — crypto core (JS side), vendored from the findmydeck
+// monorepo (crypto/ts/crypto.mjs), where its interop tests live.
 // Runs in Node (tests) and the browser (dashboard, plugin frontend bundle).
-// Wire-compatible with crypto/py/fmsd_crypto.py — see tests/interop.test.mjs.
 //
-// Invariants (spec §0/§1):
+// Invariants:
 //  - password, seed, box_sk, sign_sk never leave the client.
 //  - Reports are sealed boxes to box_pk (X25519, ephemeral sender).
 //  - Commands are Ed25519-detached-signed over the EXACT payload string;

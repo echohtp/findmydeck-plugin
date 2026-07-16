@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
 import urllib.error
 import urllib.request
@@ -47,6 +48,24 @@ class ApiError(Exception):
         self.status = status
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # Following a redirect would resend the Authorization header wherever
+    # the server points it. The API never redirects — refuse instead.
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_opener: urllib.request.OpenerDirector | None = None
+
+
+def _get_opener() -> urllib.request.OpenerDirector:
+    global _opener
+    if _opener is None:
+        _opener = urllib.request.build_opener(
+            _NoRedirect, urllib.request.HTTPSHandler(context=_ssl_context()))
+    return _opener
+
+
 def _request(method: str, url: str, body: dict | None = None,
              token: str | None = None, timeout: int = 20):
     headers = {"content-type": "application/json"}
@@ -55,16 +74,24 @@ def _request(method: str, url: str, body: dict | None = None,
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as res:
+        with _get_opener().open(req, timeout=timeout) as res:
             raw = res.read().decode()
             return res.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
         raise ApiError(e.code, e.read().decode(errors="replace")) from e
 
 
+# Plain http would expose the bearer token and the lost-mode chat to the
+# network; loopback is exempt for self-hosted development.
+_LOOPBACK = re.compile(r"^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$")
+
+
 class Api:
     def __init__(self, server_url: str):
-        self.base = server_url.rstrip("/")
+        base = server_url.rstrip("/")
+        if not base.startswith("https://") and not _LOOPBACK.match(base):
+            raise ValueError("server URL must use https://")
+        self.base = base
 
     def enroll(self, pair_code: str, box_pk: str, sign_pk: str,
                salt: str, kdf: dict, device_name: str) -> dict:
@@ -89,13 +116,6 @@ class Api:
             return body if status == 200 else None
         except (ApiError, OSError):
             return None
-
-    def get_ring(self, device_id: str, token: str) -> int:
-        try:
-            _, body = _request("GET", f"{self.base}/v1/ring/{device_id}", token=token)
-            return int((body or {}).get("ring", 0))
-        except (ApiError, OSError, ValueError):
-            return 0
 
     def get_messages(self, device_id: str, token: str) -> list:
         try:

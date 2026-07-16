@@ -1,9 +1,9 @@
-"""Device state machine — spec §3.
+"""Device state machine.
 
 Persists enrollment + mode + last_applied_counter to disk. apply_command is
-the ONLY way mode changes: signature verified against enrolled sign_pk,
-counter strictly monotonic. A compromised server relaying garbage cannot
-move this state machine.
+the ONLY way mode (or the ring counter) changes: signature verified against
+the enrolled sign_pk, counter strictly monotonic. A compromised server
+relaying garbage cannot move this state machine.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ MODES = ("normal", "lost")
 
 # Seconds between report attempts per mode. Normal also reports on
 # wake/network-connect and on UI events; these are the autonomous ceilings.
-# 'lost' is the active tracking mode (was split into lost+stolen) — it scans
-# aggressively, adds Bluetooth, and reports often.
+# 'lost' is the active tracking mode — it scans aggressively, adds
+# Bluetooth, and reports often.
 REPORT_INTERVAL = {"normal": 3600, "lost": 90}
 # Background loop heartbeat: how long it sleeps between autonomous checks.
 # Normal stays lazy (battery); lost ticks tight so a lost Deck reports and
@@ -33,12 +33,14 @@ DEFAULTS = {
     "device_token": "",
     "box_pk": "",
     "sign_pk": "",
+    "salt": "",   # KDF salt (public) — lets the QAM re-derive keys to prove
+    "kdf": None,  # ownership (password-verified unenroll)
     "mode": "normal",
     "last_applied_counter": 0,
     "seq": 0,
     "last_report_ts": 0,       # unix ms of last DELIVERED report
     "last_report_ok": False,
-    "last_ring": 0,            # highest ring_counter we've acted on
+    "last_ring": 0,            # highest signed ring counter we've acted on
     "command": None,  # last applied command dict (message/contact for lost UI)
 }
 
@@ -66,15 +68,16 @@ class DeviceState:
 
     # -- enrollment -------------------------------------------------------
     def enroll(self, server_url: str, device_id: str, device_token: str,
-               box_pk: str, sign_pk: str) -> None:
+               box_pk: str, sign_pk: str, salt: str, kdf: dict) -> None:
         self.data.update(
             enrolled=True, server_url=server_url.rstrip("/"), device_id=device_id,
             device_token=device_token, box_pk=box_pk, sign_pk=sign_pk,
-            mode="normal", last_applied_counter=0, seq=0, command=None,
+            salt=salt, kdf=kdf,
+            mode="normal", last_applied_counter=0, seq=0, last_ring=0, command=None,
         )
         self.save()
 
-    # -- the load-bearing check (§1.3): verify THEN parse, counter advances --
+    # -- the load-bearing check: verify THEN parse, counter advances -------
     def apply_command(self, payload: str, sig: str) -> tuple[bool, str]:
         if not self.data["enrolled"]:
             return False, "not enrolled"
@@ -84,11 +87,19 @@ class DeviceState:
             cmd = json.loads(payload)
         except ValueError:
             return False, "payload not JSON"
+        if "action" in cmd:
+            # Owner-signed action payloads (e.g. unenroll) are consumed by
+            # their own endpoints; the relayed command channel must not be
+            # able to spend their counters.
+            return False, "not a mode command"
         counter = cmd.get("counter")
         if not isinstance(counter, int) or counter <= self.data["last_applied_counter"]:
             return False, "replayed or stale counter"
         if cmd.get("mode") not in MODES:
             return False, "unknown mode"
+        ring = cmd.get("ring")
+        if isinstance(ring, int) and ring > self.data["last_ring"]:
+            self.data["last_ring"] = ring  # caller compares before/after to ring
         self.data["mode"] = cmd["mode"]
         self.data["last_applied_counter"] = counter
         self.data["command"] = cmd
@@ -119,6 +130,8 @@ class DeviceState:
             "mode": self.data["mode"],
             "seq": self.data["seq"],
             "counter": self.data["last_applied_counter"],
+            "salt": self.data["salt"],  # public — needed to re-derive keys
+            "kdf": self.data["kdf"],
             "last_report_ts": self.data["last_report_ts"],
             "last_report_ok": self.data["last_report_ok"],
             "command": self.data["command"],

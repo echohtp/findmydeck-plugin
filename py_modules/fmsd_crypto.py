@@ -8,9 +8,9 @@ The device only ever needs the PUBLIC halves: crypto_box_seal to box_pk
 (reports) and crypto_sign_verify_detached vs sign_pk (commands). No secret
 key material exists on this side — nothing here derives, signs, or decrypts.
 
-Wire-compatible with crypto/py/fmsd_crypto.py (PyNaCl) and
-crypto/ts/crypto.mjs (libsodium.js) — proven by tests/test_plugin.py
-CtypesInteropTest, which round-trips against the PyNaCl implementation.
+Wire-compatible with the owner-side implementations in the findmydeck
+monorepo (crypto/py PyNaCl, crypto/ts libsodium.js); its interop tests
+round-trip this module against the PyNaCl implementation.
 """
 
 from __future__ import annotations

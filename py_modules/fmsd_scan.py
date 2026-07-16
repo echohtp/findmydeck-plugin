@@ -1,4 +1,4 @@
-"""WiFi + BT environment scan — spec §3 "scan quality".
+"""WiFi + BT environment scan.
 
 Sends {bssid, rssi, ch, freq} per AP (RSSI-weighted solve needs signal
 strength, not a bare BSSID list). BSSIDs are NEVER resolved to coordinates
@@ -84,8 +84,8 @@ def parse_nmcli(text: str) -> list[dict]:
 
 
 def wifi_scan(interface: str = "wlan0", active: bool = False, cap: int = 40) -> list[dict]:
-    """Best AP list we can get. `active=True` (stolen mode) forces a rescan;
-    passive uses the last cached results (battery-friendly, spec §3 normal)."""
+    """Best AP list we can get. `active=True` (lost mode) forces a rescan;
+    passive uses the last cached results (battery-friendly for normal mode)."""
     out = _run(["iw", "dev", interface, "scan"] + ([] if active else ["dump"]))
     aps = parse_iw_scan(out)
     if not aps:
@@ -107,8 +107,8 @@ def parse_bluetoothctl(text: str) -> list[dict]:
 
 
 def bt_scan(window_s: int = 10) -> list[dict]:
-    """Nearby BT devices (stolen mode only — thief's phone/earbuds/car recur
-    across reports and turn blobs into a movement track for the owner)."""
+    """Nearby BT devices (lost mode only — recurring phones/earbuds/cars
+    across reports turn blobs into a movement track for the owner)."""
     _run(["bluetoothctl", "--timeout", str(window_s), "scan", "on"], timeout=window_s + 5)
     return parse_bluetoothctl(_run(["bluetoothctl", "devices"]))
 
