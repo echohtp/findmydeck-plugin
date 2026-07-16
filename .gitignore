@@ -1,0 +1,6 @@
+node_modules/
+dist/
+backend/out/
+out/
+*.log
+__pycache__/
